@@ -1,9 +1,6 @@
 """
-Landline Validity Checker
-- Full stealth mode to bypass bot detection
-- Dual strategy: API interception + DOM fallback
-- Auto-retry on page load failure
-- Works on Python 3.14 Windows + Streamlit Cloud (Linux)
+Landline Validity Checker - Stable Working Version
+Uses simple DOM checking - the version that worked correctly.
 """
 import sys
 import asyncio
@@ -16,7 +13,6 @@ import subprocess
 import streamlit as st
 import pandas as pd
 from io import BytesIO
-import json
 
 @st.cache_resource(show_spinner="Installing browser (first run only)…")
 def install_playwright_browsers():
@@ -28,41 +24,10 @@ def install_playwright_browsers():
 
 install_playwright_browsers()
 
-# ── Full stealth init script ──────────────────────────────────────────────────
-STEALTH_SCRIPT = """
-// Hide webdriver
-Object.defineProperty(navigator, 'webdriver', {get: () => false});
-
-// Mock plugins
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3, 4, 5],
-});
-
-// Mock languages
-Object.defineProperty(navigator, 'languages', {
-    get: () => ['en-US', 'en'],
-});
-
-// Mock permissions
-const originalQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (parameters) => (
-    parameters.name === 'notifications' ?
-        Promise.resolve({ state: Notification.permission }) :
-        originalQuery(parameters)
-);
-
-// Hide automation chrome
-window.chrome = { runtime: {} };
-
-// Mock screen dimensions
-Object.defineProperty(screen, 'width',  {get: () => 1920});
-Object.defineProperty(screen, 'height', {get: () => 1080});
-"""
-
 async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb):
     from playwright.async_api import async_playwright, expect as aexpect
 
-    TARGET  = "https://eand.ae/ecare/c/quick-pay"
+    TARGET = "https://eand.ae/ecare/c/quick-pay"
     results = []
 
     async with async_playwright() as p:
@@ -74,15 +39,8 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
                 "--disable-dev-shm-usage",
                 "--disable-setuid-sandbox",
                 "--disable-gpu",
-                "--window-size=1920,1080",
-                "--start-maximized",
-                "--disable-infobars",
-                "--disable-extensions",
-                "--ignore-certificate-errors",
-                "--allow-running-insecure-content",
             ]
         )
-
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -92,64 +50,15 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
             timezone_id="Asia/Dubai",
-            # Pretend to be a real desktop browser
-            java_script_enabled=True,
-            accept_downloads=False,
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            }
+        )
+        page = await context.new_page()
+        await page.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>false});"
         )
 
-        await context.add_init_script(STEALTH_SCRIPT)
-        page = await context.new_page()
-
-        # ── API interception state ─────────────────────────────────────────────
-        api_result = {"data": None, "received": False}
-
-        def handle_response(response):
-            url = response.url.lower()
-            if any(k in url for k in ["account", "bill", "quick", "pay",
-                                       "balance", "inquiry", "ecare", "api"]):
-                async def read_body():
-                    try:
-                        body = await response.json()
-                        api_result["data"]     = body
-                        api_result["received"] = True
-                    except Exception:
-                        try:
-                            text = await response.text()
-                            if any(k in text.lower() for k in
-                                   ["amount", "bill", "valid", "invalid", "account"]):
-                                api_result["data"]     = text
-                                api_result["received"] = True
-                        except Exception:
-                            pass
-                asyncio.ensure_future(read_body())
-
-        page.on("response", handle_response)
-
-        # ── Helpers ───────────────────────────────────────────────────────────
-        async def load_page(retries=3):
-            """Load TARGET with retries and stealth delays."""
-            for attempt in range(1, retries + 1):
-                try:
-                    api_result["data"]     = None
-                    api_result["received"] = False
-                    # Random-ish delay to look human
-                    await asyncio.sleep(0.5 + attempt * 0.3)
-                    await page.goto(TARGET, timeout=60000,
-                                    wait_until="domcontentloaded")
-                    await page.wait_for_load_state("networkidle", timeout=30000)
-                    # Small human-like pause
-                    await asyncio.sleep(0.8)
-                    return True
-                except Exception as e:
-                    log_cb(f"  ⚠️ Load attempt {attempt}/3 failed: {str(e)[:60]}")
-                    if attempt == retries:
-                        return False
-                    await asyncio.sleep(2 * attempt)
-            return False
+        async def reload():
+            await page.goto(TARGET, timeout=60000, wait_until="domcontentloaded")
+            await page.wait_for_load_state("networkidle", timeout=30000)
 
         async def find_input():
             for sel in [
@@ -157,11 +66,10 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
                 'input[placeholder*="number" i]',
                 'input[placeholder*="account" i]',
                 'input[placeholder*="phone" i]',
-                'input[placeholder*="landline" i]',
                 'input[type="text"]',
             ]:
                 try:
-                    await page.wait_for_selector(sel, timeout=6000)
+                    await page.wait_for_selector(sel, timeout=8000)
                     if await page.locator(sel).count() > 0:
                         return sel
                 except Exception:
@@ -178,58 +86,16 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
                 return btn.first
             return None
 
-        def parse_api_result(data):
-            if data is None:
-                return None, None
-            text = json.dumps(data).lower() if isinstance(data, dict) else str(data).lower()
-            if any(k in text for k in ["invalid", "not found", "no account",
-                                        "notfound", "does not exist"]):
-                return "Invalid", ""
-            if isinstance(data, dict):
-                for key in ["amountdue", "amount_due", "amount", "bill",
-                             "balance", "outstandingamount", "totalamount",
-                             "dueamount", "outstanding", "total"]:
-                    val = find_key(data, key)
-                    if val is not None:
-                        return "Valid", str(val)
-                return "Valid", ""
-            if any(k in text for k in ["valid", "amount", "bill", "balance"]):
-                return "Valid", ""
-            return None, None
-
-        def find_key(d, key):
-            if isinstance(d, dict):
-                for k, v in d.items():
-                    if k.lower() == key:
-                        return v
-                    r = find_key(v, key)
-                    if r is not None:
-                        return r
-            elif isinstance(d, list):
-                for item in d:
-                    r = find_key(item, key)
-                    if r is not None:
-                        return r
-            return None
-
-        # ── Initial load ──────────────────────────────────────────────────────
+        # Initial load
         log_cb(f"🌐 Loading {TARGET} …")
-        ok = await load_page(retries=3)
-        if not ok:
-            log_cb("❌ Could not load website after 3 attempts!")
-            await browser.close()
-            return [{"number": n, "status": "Error",
-                     "bill": "Website unreachable"} for n in numbers]
+        await reload()
         log_cb("✅ Site loaded.")
 
         active_sel = await find_input()
         if not active_sel:
-            # Take a screenshot to help debug (saved to /tmp)
-            await page.screenshot(path="/tmp/debug_noInput.png")
-            log_cb(f"❌ No input found. Page title: {await page.title()}")
+            log_cb("❌ Could not find input field!")
             await browser.close()
-            return [{"number": n, "status": "Error",
-                     "bill": "Input field not found"} for n in numbers]
+            return [{"number": n, "status": "Error", "bill": "Input not found"} for n in numbers]
 
         log_cb(f"🔍 Input detected: {active_sel}")
         total = len(numbers)
@@ -239,83 +105,54 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
             log_cb(f"({idx+1}/{total}) → {number}")
             status, bill = "Error", ""
 
-            api_result["data"]     = None
-            api_result["received"] = False
-
             try:
-                # Ensure input exists
+                # Ensure input is on page
                 if await page.locator(active_sel).count() == 0:
                     log_cb("  ⚠️ Input gone, reloading…")
-                    ok = await load_page(retries=2)
-                    if not ok:
-                        raise Exception("Page reload failed")
+                    await reload()
                     active_sel = await find_input() or active_sel
 
-                # Human-like: small pause before typing
-                await asyncio.sleep(0.3)
+                # Fill number
                 await page.fill(active_sel, "")
-                await asyncio.sleep(0.2)
-                # Type like a human (char by char) instead of instant fill
-                await page.type(active_sel, number, delay=50)
+                await page.fill(active_sel, number)
 
-                # Human-like: pause before clicking
-                await asyncio.sleep(0.4)
+                # Click Next
                 btn = await find_next_btn()
                 if btn:
                     await btn.click()
                 else:
                     await page.keyboard.press("Enter")
 
-                # ── Strategy 1: API interception ──────────────────────────────
-                api_status, api_bill = None, None
-                for _ in range(80):          # wait up to 8 seconds
-                    await asyncio.sleep(0.1)
-                    if api_result["received"]:
-                        api_status, api_bill = parse_api_result(api_result["data"])
-                        if api_status is not None:
-                            break
+                # Wait for EITHER valid result OR invalid message
+                valid_loc   = page.locator("#amountPaid")
+                invalid_loc = page.locator("text=Invalid account number")
 
-                if api_status is not None:
-                    status = api_status
-                    bill   = api_bill or ""
-                    icon   = "✅" if status == "Valid" else "❌"
-                    log_cb(f"  {icon} {status}" + (f" — Bill: {bill}" if bill else ""))
+                await aexpect(
+                    valid_loc.or_(invalid_loc)
+                ).to_be_visible(timeout=30000)
 
+                if await valid_loc.is_visible():
+                    bill   = await valid_loc.input_value()
+                    status = "Valid"
+                    log_cb(f"  ✅ Valid — Bill: {bill}")
+                elif await invalid_loc.is_visible():
+                    status = "Invalid"
+                    log_cb(f"  ❌ Invalid")
                 else:
-                    # ── Strategy 2: DOM fallback ──────────────────────────────
-                    log_cb("  ℹ️ Falling back to DOM…")
-                    valid_loc   = page.locator("#amountPaid")
-                    invalid_loc = page.locator("text=Invalid account number")
-                    try:
-                        await aexpect(
-                            valid_loc.or_(invalid_loc)
-                        ).to_be_visible(timeout=15000)
+                    status = "Unknown"
+                    log_cb(f"  ❓ Unknown response")
 
-                        if await valid_loc.is_visible():
-                            bill   = await valid_loc.input_value()
-                            status = "Valid"
-                            log_cb(f"  ✅ Valid (DOM) — Bill: {bill}")
-                        elif await invalid_loc.is_visible():
-                            status = "Invalid"
-                            log_cb(f"  ❌ Invalid (DOM)")
-                        else:
-                            status = "Unknown"
-                    except Exception as dom_err:
-                        status = "Error"
-                        bill   = f"Timeout: {str(dom_err)[:60]}"
-                        log_cb(f"  ⚠️ DOM timeout: {str(dom_err)[:50]}")
-
-                # ── Go back to form ───────────────────────────────────────────
+                # Go back to form for next number
                 back = page.locator('button:has-text("Back")')
                 if await back.is_visible():
                     await back.click()
                     try:
-                        await page.wait_for_selector(active_sel, timeout=6000)
+                        await page.wait_for_selector(active_sel, timeout=8000)
                     except Exception:
-                        await load_page(retries=2)
+                        await reload()
                         active_sel = await find_input() or active_sel
                 else:
-                    await load_page(retries=2)
+                    await reload()
                     active_sel = await find_input() or active_sel
 
             except Exception as e:
@@ -323,14 +160,14 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
                 bill   = str(e)[:120]
                 log_cb(f"  ⚠️ Error: {str(e)[:80]}")
                 try:
-                    await load_page(retries=2)
+                    await reload()
                     active_sel = await find_input() or active_sel
                 except Exception:
                     pass
 
             results.append({"number": number, "status": status, "bill": bill})
             progress_cb((idx + 1) / total)
-            await asyncio.sleep(max(delay_ms / 1000 - 0.5, 0.5))
+            await asyncio.sleep(delay_ms / 1000)
 
         await browser.close()
     return results
@@ -382,8 +219,8 @@ if uploaded_file:
 
         with st.expander("⚙️ Settings"):
             delay_ms = st.slider(
-                "Delay between requests (ms)", 500, 4000, 1500, step=250,
-                help="Lower = faster. Increase if website blocks requests."
+                "Delay between requests (ms)", 1000, 5000, 2000, step=500,
+                help="Increase if the website gives errors."
             )
 
         if st.button("🚀 Start Validity Check", type="primary"):

@@ -1,6 +1,6 @@
 """
-Landline Validity Checker - Stable Working Version
-Uses simple DOM checking - the version that worked correctly.
+Landline Validity Checker - Fresh Page Per Number (Stable & Reliable)
+Best approach: Reload page for each check to avoid state degradation
 """
 import sys
 import asyncio
@@ -51,202 +51,181 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
             locale="en-US",
             timezone_id="Asia/Dubai",
         )
-        page = await context.new_page()
-        await page.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>false});"
-        )
 
-        async def reload():
-            await page.goto(TARGET, timeout=60000, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_load_state("networkidle", timeout=20000)
-            except:
-                await page.wait_for_load_state("domcontentloaded", timeout=5000)
-
-        async def find_input():
-            for sel in [
-                'input[type="tel"]',
-                'input[placeholder*="number" i]',
-                'input[placeholder*="account" i]',
-                'input[placeholder*="phone" i]',
-                'input[type="text"]',
-            ]:
-                try:
-                    if await page.locator(sel).count() > 0:
-                        return sel
-                except Exception:
-                    continue
-            return None
-
-        async def find_next_btn():
-            for label in ["Next", "Submit", "Check", "Go", "Search", "Proceed"]:
-                btn = page.locator(f'button:has-text("{label}")')
-                if await btn.count() > 0:
-                    try:
-                        if await btn.first.is_visible(timeout=2000):
-                            return btn.first
-                    except:
-                        pass
-            try:
-                btn = page.locator('button[type="submit"]')
-                if await btn.count() > 0 and await btn.first.is_visible(timeout=2000):
-                    return btn.first
-            except:
-                pass
-            return None
-        
-        async def safe_click_or_enter(btn):
-            """Try to click button, fallback to Enter key - faster"""
-            if not btn:
-                try:
-                    await page.keyboard.press("Enter", delay=100)
-                    await asyncio.sleep(0.5)
-                    return True
-                except:
-                    return False
-            try:
-                await asyncio.wait_for(btn.click(timeout=5000), timeout=6)
-                await asyncio.sleep(0.5)
-                return True
-            except:
-                try:
-                    await page.keyboard.press("Enter", delay=100)
-                    await asyncio.sleep(0.5)
-                    return True
-                except:
-                    return False
-        
-        async def wait_for_response(timeout_ms=25000):
-            """Wait for either valid or invalid result with timeout"""
-            valid_loc   = page.locator("#amountPaid")
-            invalid_loc = page.locator("text=Invalid account number")
-            try:
-                await aexpect(
-                    valid_loc.or_(invalid_loc)
-                ).to_be_visible(timeout=timeout_ms)
-                return True
-            except:
-                return False
-
-        # Initial load
-        log_cb(f"🌐 Loading {TARGET} …")
-        await reload()
-        log_cb("✅ Site loaded.")
-
-        active_sel = await find_input()
-        if not active_sel:
-            log_cb("❌ Could not find input field!")
-            await browser.close()
-            return [{"number": n, "status": "Error", "bill": "Input not found"} for n in numbers]
-
-        log_cb(f"🔍 Input detected: {active_sel}")
         total = len(numbers)
-        consecutive_errors = 0
 
         for idx, number in enumerate(numbers):
             status_cb(f"⏳ ({idx+1}/{total}) Checking: **{number}**")
             log_cb(f"({idx+1}/{total}) → {number}")
             status, bill = "Error", ""
 
+            page = None
             try:
-                # Check if input still exists, if not try to find it without full reload
-                if await page.locator(active_sel).count() == 0:
-                    log_cb("  ⚠️ Input not found, recovering…")
-                    active_sel = await find_input()
-                    if not active_sel:
-                        log_cb("  🔄 Full reload needed…")
-                        await reload()
-                        active_sel = await find_input() or active_sel
+                # Fresh page for each number - guarantees clean state
+                page = await context.new_page()
+                await page.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>false});"
+                )
 
-                # Fill number quickly
-                inp = page.locator(active_sel).first
-                await inp.click(timeout=3000)
-                await inp.fill(number, timeout=3000)
-                await asyncio.sleep(0.3)
-
-                # Try to submit (Enter key is faster than clicking)
-                btn = await find_next_btn()
-                click_success = await safe_click_or_enter(btn)
-                
-                if not click_success:
-                    log_cb(f"  ⚠️ Submit failed, retrying…")
-                    await asyncio.sleep(0.5)
-                    click_success = await safe_click_or_enter(btn)
-
-                if not click_success:
-                    raise Exception("Failed to submit form")
-
-                # Wait for response with adaptive timeout
-                timeout_val = 25000
-                if consecutive_errors > 2:
-                    timeout_val = 15000  # Faster timeout if having issues
-                
-                resp_ok = await wait_for_response(timeout_val)
-                if not resp_ok:
-                    raise Exception("No response from server")
-
-                # Check result
-                valid_loc   = page.locator("#amountPaid")
-                invalid_loc = page.locator("text=Invalid account number")
-
-                if await valid_loc.is_visible(timeout=1000):
-                    try:
-                        bill   = await valid_loc.input_value(timeout=1000)
-                    except:
-                        bill = "N/A"
-                    status = "Valid"
-                    log_cb(f"  ✅ Valid — Bill: {bill}")
-                    consecutive_errors = 0
-                elif await invalid_loc.is_visible(timeout=1000):
-                    status = "Invalid"
-                    log_cb(f"  ❌ Invalid")
-                    consecutive_errors = 0
-                else:
-                    status = "Unknown"
-                    log_cb(f"  ❓ Unknown response")
-                    consecutive_errors += 1
-
-                # Go back for next number - use Back button if available
-                back_btn = page.locator('button:has-text("Back")')
-                back_found = False
+                # Load page
+                await page.goto(TARGET, timeout=60000, wait_until="domcontentloaded")
                 try:
-                    if await back_btn.count() > 0 and await back_btn.first.is_visible(timeout=2000):
-                        await back_btn.first.click(timeout=5000)
-                        await asyncio.sleep(0.5)
-                        # Verify we're back at input form
-                        if await page.locator(active_sel).count() > 0:
-                            back_found = True
+                    await page.wait_for_load_state("networkidle", timeout=15000)
                 except:
                     pass
-                
-                if not back_found:
-                    # Reload only if Back didn't work
-                    log_cb("  🔄 Reloading for next check…")
-                    await reload()
-                    active_sel = await find_input() or active_sel
+                await asyncio.sleep(0.2)
+
+                # Find input field
+                input_sel = None
+                for sel in [
+                    'input[type="tel"]',
+                    'input[placeholder*="number" i]',
+                    'input[placeholder*="account" i]',
+                    'input[placeholder*="phone" i]',
+                    'input[type="text"]',
+                ]:
+                    try:
+                        if await page.locator(sel).count() > 0:
+                            input_sel = sel
+                            break
+                    except:
+                        continue
+
+                if not input_sel:
+                    status = "Error"
+                    bill = "Input field not found"
+                    log_cb(f"  ❌ {bill}")
+                    results.append({"number": number, "status": status, "bill": bill})
+                    progress_cb((idx + 1) / total)
+                    await asyncio.sleep(delay_ms / 1000)
+                    if page:
+                        await page.close()
+                    continue
+
+                # Fill number
+                inp_locator = page.locator(input_sel).first
+                await inp_locator.click(timeout=3000)
+                await inp_locator.fill(number, timeout=3000)
+                await asyncio.sleep(0.2)
+
+                # Find and click submit button
+                submit_btn = None
+                for label in ["Next", "Submit", "Check", "Go", "Search", "Proceed"]:
+                    btn = page.locator(f'button:has-text("{label}")').first
+                    try:
+                        if await btn.count() > 0 and await btn.is_visible(timeout=1000):
+                            submit_btn = btn
+                            break
+                    except:
+                        pass
+
+                # If no button found, try generic submit button
+                if not submit_btn:
+                    btn = page.locator('button[type="submit"]').first
+                    try:
+                        if await btn.count() > 0:
+                            submit_btn = btn
+                    except:
+                        pass
+
+                # Submit form
+                submit_ok = False
+                if submit_btn:
+                    try:
+                        await submit_btn.click(timeout=4000)
+                        submit_ok = True
+                        await asyncio.sleep(0.5)
+                    except:
+                        pass
+
+                if not submit_ok:
+                    try:
+                        await page.keyboard.press("Enter", delay=100)
+                        submit_ok = True
+                        await asyncio.sleep(0.5)
+                    except:
+                        pass
+
+                if not submit_ok:
+                    status = "Error"
+                    bill = "Could not submit form"
+                    log_cb(f"  ❌ {bill}")
+                    results.append({"number": number, "status": status, "bill": bill})
+                    progress_cb((idx + 1) / total)
+                    await asyncio.sleep(delay_ms / 1000)
+                    if page:
+                        await page.close()
+                    continue
+
+                # Wait for result
+                valid_loc = page.locator("#amountPaid")
+                invalid_loc = page.locator("text=Invalid account number")
+
+                try:
+                    await asyncio.wait_for(
+                        aexpect(valid_loc.or_(invalid_loc)).to_be_visible(),
+                        timeout=18
+                    )
+                except asyncio.TimeoutError:
+                    status = "Error"
+                    bill = "Response timeout"
+                    log_cb(f"  ⚠️ {bill}")
+                    results.append({"number": number, "status": status, "bill": bill})
+                    progress_cb((idx + 1) / total)
+                    await asyncio.sleep(delay_ms / 1000)
+                    if page:
+                        await page.close()
+                    continue
+                except Exception as e:
+                    status = "Error"
+                    bill = str(e)[:80]
+                    log_cb(f"  ⚠️ Error: {bill[:50]}")
+                    results.append({"number": number, "status": status, "bill": bill})
+                    progress_cb((idx + 1) / total)
+                    await asyncio.sleep(delay_ms / 1000)
+                    if page:
+                        await page.close()
+                    continue
+
+                # Check which result is visible
+                try:
+                    if await valid_loc.is_visible(timeout=1000):
+                        try:
+                            bill = await valid_loc.input_value(timeout=1000)
+                        except:
+                            bill = "N/A"
+                        status = "Valid"
+                        log_cb(f"  ✅ Valid — Bill: {bill}")
+                except:
+                    pass
+
+                if status == "Error":
+                    try:
+                        if await invalid_loc.is_visible(timeout=1000):
+                            status = "Invalid"
+                            log_cb(f"  ❌ Invalid")
+                    except:
+                        pass
+
+                if status == "Error":
+                    status = "Unknown"
+                    log_cb(f"  ❓ Unknown response")
 
             except Exception as e:
                 status = "Error"
-                bill   = str(e)[:100]
-                log_cb(f"  ⚠️ Error: {str(e)[:70]}")
-                consecutive_errors += 1
-                
-                # Smart recovery
-                if consecutive_errors > 3:
-                    log_cb("  🔄 Multiple errors, reloading…")
-                    try:
-                        await reload()
-                        active_sel = await find_input() or active_sel
-                        consecutive_errors = 0
-                    except Exception as reload_err:
-                        log_cb(f"  ❌ Reload failed: {str(reload_err)[:50]}")
+                bill = str(e)[:100]
+                log_cb(f"  ⚠️ Unexpected error: {str(e)[:60]}")
 
             results.append({"number": number, "status": status, "bill": bill})
             progress_cb((idx + 1) / total)
-            
-            # Adaptive delay: shorter if successful, slightly longer if errors
-            sleep_time = (delay_ms / 1000) * (1 + 0.3 * min(consecutive_errors, 2))
-            await asyncio.sleep(sleep_time)
+            await asyncio.sleep(delay_ms / 1000)
+
+            # Close page after each check
+            if page:
+                try:
+                    await page.close()
+                except:
+                    pass
 
         await browser.close()
     return results
@@ -298,8 +277,8 @@ if uploaded_file:
 
         with st.expander("⚙️ Settings"):
             delay_ms = st.slider(
-                "Delay between requests (ms)", 500, 3000, 800, step=100,
-                help="Lower = Faster (but more errors on slow connections). Increase if site throttles."
+                "Delay between requests (ms)", 500, 2000, 1000, step=100,
+                help="Lower = Faster. Increase if you get rate-limit errors from the website."
             )
 
         if st.button("🚀 Start Validity Check", type="primary"):

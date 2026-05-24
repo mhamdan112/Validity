@@ -58,7 +58,10 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
 
         async def reload():
             await page.goto(TARGET, timeout=60000, wait_until="domcontentloaded")
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=20000)
+            except:
+                await page.wait_for_load_state("domcontentloaded", timeout=5000)
 
         async def find_input():
             for sel in [
@@ -69,7 +72,6 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
                 'input[type="text"]',
             ]:
                 try:
-                    await page.wait_for_selector(sel, timeout=8000)
                     if await page.locator(sel).count() > 0:
                         return sel
                 except Exception:
@@ -79,12 +81,52 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
         async def find_next_btn():
             for label in ["Next", "Submit", "Check", "Go", "Search", "Proceed"]:
                 btn = page.locator(f'button:has-text("{label}")')
-                if await btn.count() > 0 and await btn.first.is_visible():
+                if await btn.count() > 0:
+                    try:
+                        if await btn.first.is_visible(timeout=2000):
+                            return btn.first
+                    except:
+                        pass
+            try:
+                btn = page.locator('button[type="submit"]')
+                if await btn.count() > 0 and await btn.first.is_visible(timeout=2000):
                     return btn.first
-            btn = page.locator('button[type="submit"]')
-            if await btn.count() > 0:
-                return btn.first
+            except:
+                pass
             return None
+        
+        async def safe_click_or_enter(btn):
+            """Try to click button, fallback to Enter key - faster"""
+            if not btn:
+                try:
+                    await page.keyboard.press("Enter", delay=100)
+                    await asyncio.sleep(0.5)
+                    return True
+                except:
+                    return False
+            try:
+                await asyncio.wait_for(btn.click(timeout=5000), timeout=6)
+                await asyncio.sleep(0.5)
+                return True
+            except:
+                try:
+                    await page.keyboard.press("Enter", delay=100)
+                    await asyncio.sleep(0.5)
+                    return True
+                except:
+                    return False
+        
+        async def wait_for_response(timeout_ms=25000):
+            """Wait for either valid or invalid result with timeout"""
+            valid_loc   = page.locator("#amountPaid")
+            invalid_loc = page.locator("text=Invalid account number")
+            try:
+                await aexpect(
+                    valid_loc.or_(invalid_loc)
+                ).to_be_visible(timeout=timeout_ms)
+                return True
+            except:
+                return False
 
         # Initial load
         log_cb(f"🌐 Loading {TARGET} …")
@@ -99,6 +141,7 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
 
         log_cb(f"🔍 Input detected: {active_sel}")
         total = len(numbers)
+        consecutive_errors = 0
 
         for idx, number in enumerate(numbers):
             status_cb(f"⏳ ({idx+1}/{total}) Checking: **{number}**")
@@ -106,68 +149,104 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
             status, bill = "Error", ""
 
             try:
-                # Ensure input is on page
+                # Check if input still exists, if not try to find it without full reload
                 if await page.locator(active_sel).count() == 0:
-                    log_cb("  ⚠️ Input gone, reloading…")
-                    await reload()
-                    active_sel = await find_input() or active_sel
+                    log_cb("  ⚠️ Input not found, recovering…")
+                    active_sel = await find_input()
+                    if not active_sel:
+                        log_cb("  🔄 Full reload needed…")
+                        await reload()
+                        active_sel = await find_input() or active_sel
 
-                # Fill number
-                await page.fill(active_sel, "")
-                await page.fill(active_sel, number)
+                # Fill number quickly
+                inp = page.locator(active_sel).first
+                await inp.click(timeout=3000)
+                await inp.fill(number, timeout=3000)
+                await asyncio.sleep(0.3)
 
-                # Click Next
+                # Try to submit (Enter key is faster than clicking)
                 btn = await find_next_btn()
-                if btn:
-                    await btn.click()
-                else:
-                    await page.keyboard.press("Enter")
+                click_success = await safe_click_or_enter(btn)
+                
+                if not click_success:
+                    log_cb(f"  ⚠️ Submit failed, retrying…")
+                    await asyncio.sleep(0.5)
+                    click_success = await safe_click_or_enter(btn)
 
-                # Wait for EITHER valid result OR invalid message
+                if not click_success:
+                    raise Exception("Failed to submit form")
+
+                # Wait for response with adaptive timeout
+                timeout_val = 25000
+                if consecutive_errors > 2:
+                    timeout_val = 15000  # Faster timeout if having issues
+                
+                resp_ok = await wait_for_response(timeout_val)
+                if not resp_ok:
+                    raise Exception("No response from server")
+
+                # Check result
                 valid_loc   = page.locator("#amountPaid")
                 invalid_loc = page.locator("text=Invalid account number")
 
-                await aexpect(
-                    valid_loc.or_(invalid_loc)
-                ).to_be_visible(timeout=30000)
-
-                if await valid_loc.is_visible():
-                    bill   = await valid_loc.input_value()
+                if await valid_loc.is_visible(timeout=1000):
+                    try:
+                        bill   = await valid_loc.input_value(timeout=1000)
+                    except:
+                        bill = "N/A"
                     status = "Valid"
                     log_cb(f"  ✅ Valid — Bill: {bill}")
-                elif await invalid_loc.is_visible():
+                    consecutive_errors = 0
+                elif await invalid_loc.is_visible(timeout=1000):
                     status = "Invalid"
                     log_cb(f"  ❌ Invalid")
+                    consecutive_errors = 0
                 else:
                     status = "Unknown"
                     log_cb(f"  ❓ Unknown response")
+                    consecutive_errors += 1
 
-                # Go back to form for next number
-                back = page.locator('button:has-text("Back")')
-                if await back.is_visible():
-                    await back.click()
-                    try:
-                        await page.wait_for_selector(active_sel, timeout=8000)
-                    except Exception:
-                        await reload()
-                        active_sel = await find_input() or active_sel
-                else:
+                # Go back for next number - use Back button if available
+                back_btn = page.locator('button:has-text("Back")')
+                back_found = False
+                try:
+                    if await back_btn.count() > 0 and await back_btn.first.is_visible(timeout=2000):
+                        await back_btn.first.click(timeout=5000)
+                        await asyncio.sleep(0.5)
+                        # Verify we're back at input form
+                        if await page.locator(active_sel).count() > 0:
+                            back_found = True
+                except:
+                    pass
+                
+                if not back_found:
+                    # Reload only if Back didn't work
+                    log_cb("  🔄 Reloading for next check…")
                     await reload()
                     active_sel = await find_input() or active_sel
 
             except Exception as e:
                 status = "Error"
-                bill   = str(e)[:120]
-                log_cb(f"  ⚠️ Error: {str(e)[:80]}")
-                try:
-                    await reload()
-                    active_sel = await find_input() or active_sel
-                except Exception:
-                    pass
+                bill   = str(e)[:100]
+                log_cb(f"  ⚠️ Error: {str(e)[:70]}")
+                consecutive_errors += 1
+                
+                # Smart recovery
+                if consecutive_errors > 3:
+                    log_cb("  🔄 Multiple errors, reloading…")
+                    try:
+                        await reload()
+                        active_sel = await find_input() or active_sel
+                        consecutive_errors = 0
+                    except Exception as reload_err:
+                        log_cb(f"  ❌ Reload failed: {str(reload_err)[:50]}")
 
             results.append({"number": number, "status": status, "bill": bill})
             progress_cb((idx + 1) / total)
-            await asyncio.sleep(delay_ms / 1000)
+            
+            # Adaptive delay: shorter if successful, slightly longer if errors
+            sleep_time = (delay_ms / 1000) * (1 + 0.3 * min(consecutive_errors, 2))
+            await asyncio.sleep(sleep_time)
 
         await browser.close()
     return results
@@ -219,8 +298,8 @@ if uploaded_file:
 
         with st.expander("⚙️ Settings"):
             delay_ms = st.slider(
-                "Delay between requests (ms)", 1000, 5000, 2000, step=500,
-                help="Increase if the website gives errors."
+                "Delay between requests (ms)", 500, 3000, 800, step=100,
+                help="Lower = Faster (but more errors on slow connections). Increase if site throttles."
             )
 
         if st.button("🚀 Start Validity Check", type="primary"):

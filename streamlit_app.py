@@ -1,6 +1,7 @@
 """
-Landline Validity Checker - Back to basics (the version that worked)
-Single browser session, simple DOM check, no retries, no complexity.
+Landline Validity Checker
+Uses Browserless.io cloud browser (free tier) which routes through global IPs
+OR falls back to local Playwright if BROWSERLESS_TOKEN not set.
 """
 import sys
 import asyncio
@@ -10,6 +11,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop(_loop)
 
 import subprocess
+import os
 import streamlit as st
 import pandas as pd
 from io import BytesIO
@@ -28,21 +30,43 @@ install_playwright_browsers()
 async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb):
     from playwright.async_api import async_playwright, expect as aexpect
 
-    TARGET  = "https://eand.ae/ecare/c/quick-pay"
+    TARGET = "https://eand.ae/ecare/c/quick-pay"
     results = []
     total   = len(numbers)
 
+    # ── Check if Browserless token is configured ──────────────────────────────
+    browserless_token = os.environ.get("BROWSERLESS_TOKEN", "")
+    using_browserless = bool(browserless_token)
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-setuid-sandbox",
-                "--disable-gpu",
-            ]
-        )
+
+        if using_browserless:
+            # Connect to Browserless cloud browser (has real global IPs)
+            log_cb("☁️ Connecting to cloud browser (Browserless)…")
+            ws_url = f"wss://chrome.browserless.io?token={browserless_token}"
+            try:
+                browser = await p.chromium.connect_over_cdp(ws_url)
+                log_cb("✅ Cloud browser connected.")
+            except Exception as e:
+                log_cb(f"❌ Browserless connection failed: {e}")
+                log_cb("⚠️ Falling back to local browser…")
+                using_browserless = False
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage",
+                          "--disable-gpu", "--disable-setuid-sandbox"]
+                )
+        else:
+            log_cb("🖥️ Using local browser…")
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox", "--disable-dev-shm-usage",
+                    "--disable-gpu", "--disable-setuid-sandbox",
+                ]
+            )
+
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -58,11 +82,17 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
             "Object.defineProperty(navigator,'webdriver',{get:()=>false});"
         )
 
-        # Load the page once
-        log_cb("🌐 Loading website…")
-        await page.goto(TARGET, timeout=60000, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle", timeout=30000)
-        log_cb("✅ Website loaded. Starting checks…")
+        # Load the site
+        log_cb(f"🌐 Loading {TARGET}…")
+        try:
+            await page.goto(TARGET, timeout=60000, wait_until="domcontentloaded")
+            await page.wait_for_load_state("networkidle", timeout=30000)
+        except Exception as e:
+            log_cb(f"❌ Page load failed: {e}")
+            await browser.close()
+            return [{"number": n, "status": "Error", "bill": "Page load failed"} for n in numbers]
+
+        log_cb("✅ Site loaded. Starting checks…")
 
         for idx, number in enumerate(numbers):
             status_cb(f"⏳ ({idx+1}/{total}) Checking: **{number}**")
@@ -70,24 +100,16 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
             status, bill = "Error", ""
 
             try:
-                # Wait for the input field
                 await page.wait_for_selector('input[type="tel"]', timeout=15000)
-
-                # Clear and fill
                 await page.fill('input[type="tel"]', "")
                 await page.fill('input[type="tel"]', number)
                 await asyncio.sleep(0.3)
-
-                # Click Next
                 await page.click('button:has-text("Next")')
 
-                # Wait for valid OR invalid result
                 valid_loc   = page.locator("#amountPaid")
                 invalid_loc = page.locator("text=Invalid account number")
 
-                await aexpect(
-                    valid_loc.or_(invalid_loc)
-                ).to_be_visible(timeout=30000)
+                await aexpect(valid_loc.or_(invalid_loc)).to_be_visible(timeout=30000)
 
                 if await valid_loc.is_visible():
                     bill   = await valid_loc.input_value()
@@ -100,7 +122,6 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
                     status = "Unknown"
                     log_cb(f"  ❓ Unknown")
 
-                # Go back for next number
                 back = page.locator('button:has-text("Back")')
                 if await back.is_visible():
                     await back.click()
@@ -112,7 +133,6 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
                 status = "Error"
                 bill   = str(e)[:100]
                 log_cb(f"  ⚠️ Error: {str(e)[:60]}")
-                # Reload on error
                 try:
                     await page.goto(TARGET, timeout=60000, wait_until="domcontentloaded")
                     await page.wait_for_load_state("networkidle", timeout=30000)
@@ -151,6 +171,14 @@ st.markdown("<style>.stProgress>div>div{background:#00b4d8}</style>", unsafe_all
 st.title("📋 Landline Validity Checker")
 st.markdown("Upload an Excel file with landline numbers to check validity on the E&D portal.")
 
+# Warn if no Browserless token
+if not os.environ.get("BROWSERLESS_TOKEN"):
+    st.warning(
+        "⚠️ **Cloud browser not configured.** "
+        "Add your `BROWSERLESS_TOKEN` in Streamlit Cloud secrets for this to work when hosted. "
+        "Running locally will work fine without it."
+    )
+
 uploaded_file = st.file_uploader("Upload Excel file (.xlsx / .xls)", type=["xlsx", "xls"])
 
 if uploaded_file:
@@ -172,13 +200,9 @@ if uploaded_file:
         st.caption(f"Total rows: {len(df)}")
 
         with st.expander("⚙️ Settings"):
-            delay_ms = st.slider(
-                "Delay between numbers (ms)", 1000, 5000, 2000, step=500,
-                help="Increase if you get errors."
-            )
+            delay_ms = st.slider("Delay between numbers (ms)", 1000, 5000, 2000, step=500)
 
         if st.button("🚀 Start Validity Check", type="primary"):
-
             progress_bar       = st.progress(0)
             status_placeholder = st.empty()
             log_placeholder    = st.empty()

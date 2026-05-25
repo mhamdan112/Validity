@@ -25,11 +25,11 @@ def install_playwright_browsers():
 install_playwright_browsers()
 
 async def check_single_number(number, browser, delay_base=1000):
-    """Check a single number with automatic retry on failure"""
+    """Check a single number with maximum reliability and accuracy"""
     from playwright.async_api import expect as aexpect
     
     TARGET = "https://eand.ae/ecare/c/quick-pay"
-    max_retries = 3
+    max_retries = 5  # More retries for accuracy
     retry_count = 0
     
     while retry_count < max_retries:
@@ -41,24 +41,25 @@ async def check_single_number(number, browser, delay_base=1000):
                 "Object.defineProperty(navigator,'webdriver',{get:()=>false});"
             )
             
-            # Load page with timeout
+            # Load page - generous timeout
             await asyncio.wait_for(
                 page.goto(TARGET, wait_until="domcontentloaded"),
-                timeout=30
+                timeout=45
             )
             
-            # Wait for network (with graceful fallback)
+            # Wait for network to settle - important for accuracy
             try:
                 await asyncio.wait_for(
                     page.wait_for_load_state("networkidle"),
-                    timeout=12
+                    timeout=20
                 )
             except asyncio.TimeoutError:
-                pass  # Continue anyway
+                # Still continue, page might be ready
+                await asyncio.sleep(1)
             
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)  # Extra settle time
             
-            # Find input field
+            # Find input field - be thorough
             input_sel = None
             for sel in [
                 'input[type="tel"]',
@@ -70,22 +71,52 @@ async def check_single_number(number, browser, delay_base=1000):
                 try:
                     count = await page.locator(sel).count()
                     if count > 0:
-                        input_sel = sel
-                        break
+                        # Verify it's actually visible
+                        try:
+                            visible = await page.locator(sel).first.is_visible(timeout=2)
+                            if visible:
+                                input_sel = sel
+                                break
+                        except:
+                            pass
                 except:
                     pass
             
             if not input_sel:
-                return "Error", "Input field not found", False
+                return "Error", "Input field not found", True  # Retry
             
-            # Click and fill input
+            # Click and fill input - with verification
             inp = page.locator(input_sel).first
-            await inp.click(timeout=3)
-            await inp.fill(number, timeout=3)
-            await asyncio.sleep(0.15)
+            try:
+                await inp.scroll_into_view_if_needed(timeout=5)
+            except:
+                pass
             
-            # Find and click submit button
+            await asyncio.sleep(0.3)
+            await inp.click(timeout=5)
+            await asyncio.sleep(0.3)
+            
+            # Clear and fill
+            await inp.fill("", timeout=3)
+            await asyncio.sleep(0.2)
+            await inp.fill(number, timeout=5)
+            await asyncio.sleep(0.5)
+            
+            # Verify number was actually entered
+            entered_value = ""
+            try:
+                entered_value = await inp.input_value(timeout=2)
+            except:
+                pass
+            
+            if not entered_value or number not in entered_value:
+                # Number didn't stick, retry
+                return "Error", "Number entry failed", True
+            
+            # Find and click submit button - look harder
             submit_clicked = False
+            
+            # Try text-based buttons first
             for btn_text in ["Next", "Submit", "Check", "Go", "Search", "Proceed"]:
                 try:
                     btns = page.locator(f'button:has-text("{btn_text}")')
@@ -93,9 +124,11 @@ async def check_single_number(number, browser, delay_base=1000):
                     if count > 0:
                         btn = btns.first
                         try:
-                            visible = await btn.is_visible(timeout=1)
+                            visible = await btn.is_visible(timeout=2)
                             if visible:
-                                await btn.click(timeout=3)
+                                await btn.scroll_into_view_if_needed(timeout=5)
+                                await asyncio.sleep(0.2)
+                                await btn.click(timeout=5)
                                 submit_clicked = True
                                 break
                         except:
@@ -103,39 +136,60 @@ async def check_single_number(number, browser, delay_base=1000):
                 except:
                     pass
             
-            # Fallback: try keyboard Enter
+            # Fallback: try submit button type
             if not submit_clicked:
                 try:
-                    await page.keyboard.press("Enter", delay=50)
+                    btn = page.locator('button[type="submit"]').first
+                    count = await btn.count()
+                    if count > 0:
+                        visible = await btn.is_visible(timeout=2)
+                        if visible:
+                            await btn.scroll_into_view_if_needed(timeout=5)
+                            await asyncio.sleep(0.2)
+                            await btn.click(timeout=5)
+                            submit_clicked = True
+                except:
+                    pass
+            
+            # Fallback: keyboard Enter
+            if not submit_clicked:
+                try:
+                    await page.keyboard.press("Enter", delay=100)
                     submit_clicked = True
                 except:
                     pass
             
             if not submit_clicked:
-                return "Error", "Could not submit", True  # Retry on submit failure
+                return "Error", "Could not submit form", True  # Retry
             
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(1)  # Wait for response
             
-            # Wait for response with timeout
+            # Wait for response - generous timeout for accuracy
             valid_loc = page.locator("#amountPaid")
             invalid_loc = page.locator("text=Invalid account number")
             
+            # Wait with longer timeout
             try:
                 await asyncio.wait_for(
                     aexpect(valid_loc.or_(invalid_loc)).to_be_visible(),
-                    timeout=16
+                    timeout=25  # Very generous timeout
                 )
             except asyncio.TimeoutError:
                 return "Error", "No response from server", True  # Retry
             except Exception as e:
                 return "Error", f"Response error: {str(e)[:40]}", True
             
-            # Check result
+            await asyncio.sleep(0.5)  # Let result fully load
+            
+            # Check result - be very thorough
             bill = ""
+            
+            # Check valid result
             try:
-                if await valid_loc.is_visible(timeout=1):
+                if await valid_loc.is_visible(timeout=2):
                     try:
-                        bill = await valid_loc.input_value(timeout=1)
+                        bill = await valid_loc.input_value(timeout=3)
+                        bill = bill.strip() if bill else "N/A"
                     except:
                         bill = "N/A"
                     await page.close()
@@ -143,13 +197,15 @@ async def check_single_number(number, browser, delay_base=1000):
             except:
                 pass
             
+            # Check invalid result
             try:
-                if await invalid_loc.is_visible(timeout=1):
+                if await invalid_loc.is_visible(timeout=2):
                     await page.close()
                     return "Invalid", "", False
             except:
                 pass
             
+            # If neither, that's unknown
             await page.close()
             return "Unknown", "", False
             
@@ -161,7 +217,7 @@ async def check_single_number(number, browser, delay_base=1000):
                 except:
                     pass
             if retry_count < max_retries:
-                await asyncio.sleep(0.5)  # Brief pause before retry
+                await asyncio.sleep(1.5)  # Longer wait between retries
             
         except Exception as e:
             retry_count += 1
@@ -171,18 +227,17 @@ async def check_single_number(number, browser, delay_base=1000):
                 except:
                     pass
             if retry_count < max_retries:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.5)
     
     return "Error", "Max retries exceeded", False
 
 
 async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb):
-    """Main checking function with browser session management"""
+    """Main checking function - accuracy focused"""
     from playwright.async_api import async_playwright
     
     results = []
     total = len(numbers)
-    error_streak = 0
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -213,17 +268,12 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
             status_cb(f"⏳ ({idx+1}/{total}) Checking: **{number}**")
             log_cb(f"({idx+1}/{total}) → {number}")
             
-            # Adaptive delay based on error streak
-            if error_streak > 0:
-                wait_time = (delay_ms / 1000) * (1 + 0.5 * min(error_streak, 3))
-                log_cb(f"  ⏱️ Delay: {wait_time:.1f}s (error recovery)")
-                await asyncio.sleep(wait_time)
-            else:
-                await asyncio.sleep(delay_ms / 1000)
+            # Use consistent, generous delay for accuracy
+            await asyncio.sleep(delay_ms / 1000)
             
             try:
-                # Check number with retry logic
-                status, bill, should_retry = await check_single_number(
+                # Check number with built-in retry (up to 5 attempts)
+                status, bill, _ = await check_single_number(
                     number, 
                     context,
                     delay_ms
@@ -231,67 +281,20 @@ async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb)
                 
                 if status == "Valid":
                     log_cb(f"  ✅ Valid — Bill: {bill}")
-                    error_streak = 0
                 elif status == "Invalid":
                     log_cb(f"  ❌ Invalid")
-                    error_streak = 0
                 elif status == "Unknown":
-                    log_cb(f"  ❓ Unknown")
-                    error_streak = 0
+                    log_cb(f"  ❓ Unknown response")
                 else:  # Error
-                    log_cb(f"  ⚠️ {bill}")
-                    error_streak += 1
-                    
-                    # Context recovery: recreate context after 3 consecutive errors
-                    if error_streak >= 3:
-                        log_cb(f"  🔄 Recovering context after errors...")
-                        try:
-                            await context.close()
-                        except:
-                            pass
-                        context = await browser.new_context(
-                            user_agent=(
-                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                "Chrome/124.0.0.0 Safari/537.36"
-                            ),
-                            viewport={"width": 1920, "height": 1080},
-                            locale="en-US",
-                            timezone_id="Asia/Dubai",
-                        )
-                        error_streak = 0
-                        log_cb(f"  ✅ Context recovered")
+                    log_cb(f"  ⚠️ Error: {bill}")
                 
                 results.append({"number": number, "status": status, "bill": bill})
                 
             except Exception as e:
                 status = "Error"
                 bill = str(e)[:100]
-                log_cb(f"  ❌ Fatal error: {str(e)[:50]}")
-                error_streak += 1
+                log_cb(f"  ❌ Fatal error: {str(e)[:60]}")
                 results.append({"number": number, "status": status, "bill": bill})
-                
-                # Recover context on fatal error
-                if error_streak >= 3:
-                    log_cb(f"  🔄 Context recovery...")
-                    try:
-                        await context.close()
-                    except:
-                        pass
-                    try:
-                        context = await browser.new_context(
-                            user_agent=(
-                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                "Chrome/124.0.0.0 Safari/537.36"
-                            ),
-                            viewport={"width": 1920, "height": 1080},
-                            locale="en-US",
-                            timezone_id="Asia/Dubai",
-                        )
-                        error_streak = 0
-                    except:
-                        log_cb(f"  ❌ Context recovery failed")
             
             progress_cb((idx + 1) / total)
         
@@ -350,8 +353,8 @@ if uploaded_file:
 
         with st.expander("⚙️ Settings"):
             delay_ms = st.slider(
-                "Delay between requests (ms)", 800, 2500, 1200, step=100,
-                help="Recommended: 1200ms. Lower = faster but more errors. Higher = slower but more stable."
+                "Delay between requests (ms)", 2000, 5000, 3000, step=100,
+                help="ACCURACY MODE: Higher delays = More accurate results. Minimum 2000ms recommended."
             )
 
         if st.button("🚀 Start Validity Check", type="primary"):

@@ -1,7 +1,6 @@
 """
 Landline Validity Checker
-Uses Browserless.io cloud browser (free tier) which routes through global IPs
-OR falls back to local Playwright if BROWSERLESS_TOKEN not set.
+Each number gets its own fresh Browserless session - no shared state.
 """
 import sys
 import asyncio
@@ -27,123 +26,166 @@ def install_playwright_browsers():
 install_playwright_browsers()
 
 
-async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb):
+async def check_one(number: str, token: str, log_cb) -> tuple[str, str]:
+    """
+    One number = one fresh browser session.
+    Works with both Browserless (cloud) and local Playwright.
+    """
     from playwright.async_api import async_playwright, expect as aexpect
 
     TARGET = "https://eand.ae/ecare/c/quick-pay"
-    results = []
-    total   = len(numbers)
-
-    # ── Check if Browserless token is configured ──────────────────────────────
-    browserless_token = os.environ.get("BROWSERLESS_TOKEN", "")
-    using_browserless = bool(browserless_token)
 
     async with async_playwright() as p:
-
-        if using_browserless:
-            # Connect to Browserless cloud browser (has real global IPs)
-            log_cb("☁️ Connecting to cloud browser (Browserless)…")
-            ws_url = f"wss://chrome.browserless.io?token={browserless_token}"
+        # ── Connect to browser ────────────────────────────────────────────────
+        if token:
             try:
-                browser = await p.chromium.connect_over_cdp(ws_url)
-                log_cb("✅ Cloud browser connected.")
+                ws = f"wss://chrome.browserless.io?token={token}"
+                browser = await p.chromium.connect_over_cdp(ws)
             except Exception as e:
-                log_cb(f"❌ Browserless connection failed: {e}")
-                log_cb("⚠️ Falling back to local browser…")
-                using_browserless = False
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage",
-                          "--disable-gpu", "--disable-setuid-sandbox"]
-                )
+                log_cb(f"  ⚠️ Browserless connect failed: {str(e)[:50]}")
+                return "Error", "Browserless connection failed"
         else:
-            log_cb("🖥️ Using local browser…")
             browser = await p.chromium.launch(
                 headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox", "--disable-dev-shm-usage",
-                    "--disable-gpu", "--disable-setuid-sandbox",
-                ]
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-gpu", "--disable-setuid-sandbox",
+                      "--disable-blink-features=AutomationControlled"]
             )
 
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-            timezone_id="Asia/Dubai",
-        )
-        page = await context.new_page()
-        await page.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>false});"
-        )
-
-        # Load the site
-        log_cb(f"🌐 Loading {TARGET}…")
         try:
-            await page.goto(TARGET, timeout=60000, wait_until="domcontentloaded")
-            await page.wait_for_load_state("networkidle", timeout=30000)
-        except Exception as e:
-            log_cb(f"❌ Page load failed: {e}")
-            await browser.close()
-            return [{"number": n, "status": "Error", "bill": "Page load failed"} for n in numbers]
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+                timezone_id="Asia/Dubai",
+            )
+            page = await context.new_page()
+            await page.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>false});"
+            )
 
-        log_cb("✅ Site loaded. Starting checks…")
-
-        for idx, number in enumerate(numbers):
-            status_cb(f"⏳ ({idx+1}/{total}) Checking: **{number}**")
-            log_cb(f"({idx+1}/{total}) → {number}")
-            status, bill = "Error", ""
-
+            # ── Load page ─────────────────────────────────────────────────────
             try:
-                await page.wait_for_selector('input[type="tel"]', timeout=15000)
-                await page.fill('input[type="tel"]', "")
-                await page.fill('input[type="tel"]', number)
-                await asyncio.sleep(0.3)
-                await page.click('button:has-text("Next")')
-
-                valid_loc   = page.locator("#amountPaid")
-                invalid_loc = page.locator("text=Invalid account number")
-
-                await aexpect(valid_loc.or_(invalid_loc)).to_be_visible(timeout=30000)
-
-                if await valid_loc.is_visible():
-                    bill   = await valid_loc.input_value()
-                    status = "Valid"
-                    log_cb(f"  ✅ Valid — Bill: {bill}")
-                elif await invalid_loc.is_visible():
-                    status = "Invalid"
-                    log_cb(f"  ❌ Invalid")
-                else:
-                    status = "Unknown"
-                    log_cb(f"  ❓ Unknown")
-
-                back = page.locator('button:has-text("Back")')
-                if await back.is_visible():
-                    await back.click()
-                else:
-                    await page.goto(TARGET, timeout=60000, wait_until="domcontentloaded")
-                    await page.wait_for_load_state("networkidle", timeout=30000)
-
+                await page.goto(TARGET, timeout=60000, wait_until="domcontentloaded")
+                await page.wait_for_load_state("networkidle", timeout=20000)
             except Exception as e:
-                status = "Error"
-                bill   = str(e)[:100]
-                log_cb(f"  ⚠️ Error: {str(e)[:60]}")
+                return "Error", f"Load failed: {str(e)[:60]}"
+
+            await asyncio.sleep(1)
+
+            # ── Find input ────────────────────────────────────────────────────
+            input_sel = None
+            for sel in [
+                'input[type="tel"]',
+                'input[placeholder*="number" i]',
+                'input[placeholder*="account" i]',
+                'input[placeholder*="phone" i]',
+                'input[type="text"]',
+            ]:
                 try:
-                    await page.goto(TARGET, timeout=60000, wait_until="domcontentloaded")
-                    await page.wait_for_load_state("networkidle", timeout=30000)
+                    await page.wait_for_selector(sel, timeout=5000)
+                    if await page.locator(sel).count() > 0:
+                        input_sel = sel
+                        break
+                except Exception:
+                    continue
+
+            if not input_sel:
+                return "Error", "Input field not found"
+
+            # ── Fill number ───────────────────────────────────────────────────
+            await page.fill(input_sel, "")
+            await asyncio.sleep(0.2)
+            await page.fill(input_sel, number)
+            await asyncio.sleep(0.3)
+
+            # ── Click Next ────────────────────────────────────────────────────
+            clicked = False
+            for label in ["Next", "Submit", "Check", "Go"]:
+                try:
+                    btn = page.locator(f'button:has-text("{label}")')
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        await btn.first.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if not clicked:
+                try:
+                    btn = page.locator('button[type="submit"]')
+                    if await btn.count() > 0:
+                        await btn.first.click()
+                        clicked = True
                 except Exception:
                     pass
 
-            results.append({"number": number, "status": status, "bill": bill})
-            progress_cb((idx + 1) / total)
-            await asyncio.sleep(delay_ms / 1000)
+            if not clicked:
+                await page.keyboard.press("Enter")
 
-        await browser.close()
+            # ── Wait for result ───────────────────────────────────────────────
+            valid_loc   = page.locator("#amountPaid")
+            invalid_loc = page.locator("text=Invalid account number")
+
+            try:
+                await aexpect(
+                    valid_loc.or_(invalid_loc)
+                ).to_be_visible(timeout=30000)
+            except Exception as e:
+                return "Error", f"Result timeout: {str(e)[:60]}"
+
+            await asyncio.sleep(0.3)
+
+            # ── Read result ───────────────────────────────────────────────────
+            if await valid_loc.is_visible():
+                bill = await valid_loc.input_value()
+                return "Valid", bill
+
+            if await invalid_loc.is_visible():
+                return "Invalid", ""
+
+            return "Unknown", ""
+
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
+async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb):
+    token = os.environ.get("BROWSERLESS_TOKEN", "")
+    total = len(numbers)
+    results = []
+
+    if token:
+        log_cb("☁️ Using Browserless cloud browser.")
+    else:
+        log_cb("🖥️ Using local browser.")
+
+    for idx, number in enumerate(numbers):
+        status_cb(f"⏳ ({idx+1}/{total}) Checking: **{number}**")
+        log_cb(f"({idx+1}/{total}) → {number}")
+
+        status, bill = await check_one(number, token, log_cb)
+
+        if status == "Valid":
+            log_cb(f"  ✅ Valid — Bill: {bill}")
+        elif status == "Invalid":
+            log_cb(f"  ❌ Invalid")
+        elif status == "Error":
+            log_cb(f"  ⚠️ {bill}")
+        else:
+            log_cb(f"  ❓ Unknown")
+
+        results.append({"number": number, "status": status, "bill": bill})
+        progress_cb((idx + 1) / total)
+        await asyncio.sleep(delay_ms / 1000)
+
     return results
 
 
@@ -171,13 +213,8 @@ st.markdown("<style>.stProgress>div>div{background:#00b4d8}</style>", unsafe_all
 st.title("📋 Landline Validity Checker")
 st.markdown("Upload an Excel file with landline numbers to check validity on the E&D portal.")
 
-# Warn if no Browserless token
 if not os.environ.get("BROWSERLESS_TOKEN"):
-    st.warning(
-        "⚠️ **Cloud browser not configured.** "
-        "Add your `BROWSERLESS_TOKEN` in Streamlit Cloud secrets for this to work when hosted. "
-        "Running locally will work fine without it."
-    )
+    st.warning("⚠️ **No BROWSERLESS_TOKEN set.** Add it in Streamlit Cloud → Settings → Secrets.")
 
 uploaded_file = st.file_uploader("Upload Excel file (.xlsx / .xls)", type=["xlsx", "xls"])
 
@@ -200,7 +237,10 @@ if uploaded_file:
         st.caption(f"Total rows: {len(df)}")
 
         with st.expander("⚙️ Settings"):
-            delay_ms = st.slider("Delay between numbers (ms)", 1000, 5000, 2000, step=500)
+            delay_ms = st.slider(
+                "Delay between numbers (ms)", 1000, 5000, 2000, step=500,
+                help="Increase if you get errors."
+            )
 
         if st.button("🚀 Start Validity Check", type="primary"):
             progress_bar       = st.progress(0)

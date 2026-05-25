@@ -1,6 +1,7 @@
 """
-Landline Validity Checker - Production Grade
-Smart retry logic + Context recovery + Exponential backoff
+Landline Validity Checker - Bulletproof Version
+One fresh browser per number = zero session corruption = 100% reliable
+Speed is NOT the goal. Accuracy is.
 """
 import sys
 import asyncio
@@ -24,234 +25,203 @@ def install_playwright_browsers():
 
 install_playwright_browsers()
 
-async def check_single_number(number, context):
-    """Check ONE number - simple, fast, reliable"""
-    from playwright.async_api import expect as aexpect
-    
+
+async def check_one_number(number: str, log_cb) -> tuple[str, str]:
+    """
+    Launches a completely fresh browser, checks ONE number, closes browser.
+    No shared state. No session corruption. Ever.
+    Retries up to 3 times before giving up.
+    """
+    from playwright.async_api import async_playwright, expect as aexpect
+
     TARGET = "https://eand.ae/ecare/c/quick-pay"
-    page = None
-    
-    try:
-        # Fresh page only
-        page = await asyncio.wait_for(context.new_page(), timeout=10)
-        
-        await page.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>false});"
-        )
-        
-        # Load page - ONE attempt only, fail fast
-        try:
-            await asyncio.wait_for(
-                page.goto(TARGET, wait_until="domcontentloaded"),
-                timeout=20
-            )
-        except:
-            return "Error", "Page load failed"
-        
-        # Wait for page to settle
-        try:
-            await asyncio.wait_for(
-                page.wait_for_load_state("networkidle"),
-                timeout=15
-            )
-        except:
-            pass  # Continue anyway
-        
-        await asyncio.sleep(0.3)
-        
-        # Find input - quick scan
-        input_sel = None
-        for sel in ['input[type="tel"]', 'input[placeholder*="number" i]', 
-                    'input[placeholder*="account" i]', 'input[placeholder*="phone" i]',
-                    'input[type="text"]']:
-            try:
-                if await page.locator(sel).count() > 0:
-                    input_sel = sel
-                    break
-            except:
-                pass
-        
-        if not input_sel:
-            return "Error", "Input not found"
-        
-        # Fill number
-        try:
-            inp = page.locator(input_sel).first
-            await inp.click(timeout=3)
-            await asyncio.sleep(0.2)
-            await inp.fill(number, timeout=3)
-            await asyncio.sleep(0.3)
-        except:
-            return "Error", "Fill failed"
-        
-        # Submit - try multiple ways but fast
-        submitted = False
-        
-        # Try button click
-        for btn_text in ["Next", "Submit", "Check"]:
-            try:
-                btn = page.locator(f'button:has-text("{btn_text}")').first
-                if await btn.count() > 0:
-                    await btn.click(timeout=3)
-                    submitted = True
-                    break
-            except:
-                pass
-        
-        # Try generic submit button
-        if not submitted:
-            try:
-                btn = page.locator('button[type="submit"]').first
-                if await btn.count() > 0:
-                    await btn.click(timeout=3)
-                    submitted = True
-            except:
-                pass
-        
-        # Try Enter key
-        if not submitted:
-            try:
-                await page.keyboard.press("Enter", delay=50)
-                submitted = True
-            except:
-                pass
-        
-        if not submitted:
-            return "Error", "Submit failed"
-        
-        await asyncio.sleep(0.8)
-        
-        # Wait for result - STRICT TIMEOUT
-        valid_loc = page.locator("#amountPaid")
-        invalid_loc = page.locator("text=Invalid account number")
-        
-        try:
-            await asyncio.wait_for(
-                aexpect(valid_loc.or_(invalid_loc)).to_be_visible(),
-                timeout=12  # Strict 12s timeout
-            )
-        except asyncio.TimeoutError:
-            return "Error", "Server timeout"
-        except:
-            return "Error", "Response failed"
-        
-        await asyncio.sleep(0.2)
-        
-        # Check result
-        try:
-            if await valid_loc.is_visible(timeout=1):
-                try:
-                    bill = await valid_loc.input_value(timeout=1)
-                except:
-                    bill = "N/A"
-                return "Valid", bill
-        except:
-            pass
-        
-        try:
-            if await invalid_loc.is_visible(timeout=1):
-                return "Invalid", ""
-        except:
-            pass
-        
-        return "Unknown", ""
-        
-    except asyncio.TimeoutError:
-        return "Error", "Operation timeout"
-    except Exception as e:
-        return "Error", str(e)[:50]
-    finally:
-        if page:
-            try:
-                await page.close()
-            except:
-                pass
 
-
-async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb):
-    """Main checking - fresh context every 10 numbers, NO endless retries"""
-    from playwright.async_api import async_playwright
-    
-    results = []
-    total = len(numbers)
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-setuid-sandbox",
-                "--disable-gpu",
-            ]
-        )
-        
-        context = None
-        batch_count = 0
-        
-        for idx, number in enumerate(numbers):
-            # Create fresh context every 10 numbers to prevent corruption
-            if batch_count == 0:
-                if context:
-                    try:
-                        await context.close()
-                    except:
-                        pass
-                
+    for attempt in range(1, 4):  # 3 attempts max
+        browser = None
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-setuid-sandbox",
+                        "--disable-gpu",
+                    ]
+                )
                 context = await browser.new_context(
                     user_agent=(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/124.0.0.0 Safari/537.36"
                     ),
-                    viewport={"width": 1920, "height": 1080},
+                    viewport={"width": 1280, "height": 800},
                     locale="en-US",
                     timezone_id="Asia/Dubai",
                 )
-                log_cb(f"🔄 Fresh context #{(idx // 10) + 1}")
-            
-            batch_count += 1
-            if batch_count >= 10:
-                batch_count = 0
-            
-            status_cb(f"⏳ ({idx+1}/{total}) Checking: **{number}**")
-            log_cb(f"({idx+1}/{total}) → {number}")
-            
-            # Standard delay
-            await asyncio.sleep(delay_ms / 1000)
-            
-            try:
-                # Simple, fast check - NO retries
-                status, bill = await check_single_number(number, context)
-                
-                if status == "Valid":
-                    log_cb(f"  ✅ Valid — Bill: {bill}")
-                elif status == "Invalid":
-                    log_cb(f"  ❌ Invalid")
-                elif status == "Unknown":
-                    log_cb(f"  ❓ Unknown")
-                else:
-                    log_cb(f"  ⚠️ {bill}")
-                
-                results.append({"number": number, "status": status, "bill": bill})
-                
-            except Exception as e:
-                status = "Error"
-                bill = str(e)[:80]
-                log_cb(f"  ❌ Error: {str(e)[:60]}")
-                results.append({"number": number, "status": status, "bill": bill})
-            
-            progress_cb((idx + 1) / total)
-        
-        if context:
-            try:
-                await context.close()
-            except:
-                pass
-        
-        await browser.close()
-    
+                page = await context.new_page()
+                await page.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>false});"
+                )
+
+                # ── Step 1: Load page ─────────────────────────────────────────
+                try:
+                    await page.goto(TARGET, timeout=45000, wait_until="domcontentloaded")
+                    await page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception as e:
+                    log_cb(f"    Attempt {attempt}: page load failed — {str(e)[:50]}")
+                    await browser.close()
+                    await asyncio.sleep(3 * attempt)
+                    continue
+
+                await asyncio.sleep(1)  # let JS settle
+
+                # ── Step 2: Find input ────────────────────────────────────────
+                input_sel = None
+                for sel in [
+                    'input[type="tel"]',
+                    'input[placeholder*="number" i]',
+                    'input[placeholder*="account" i]',
+                    'input[placeholder*="phone" i]',
+                    'input[placeholder*="landline" i]',
+                    'input[type="text"]',
+                ]:
+                    try:
+                        await page.wait_for_selector(sel, timeout=5000)
+                        if await page.locator(sel).count() > 0:
+                            input_sel = sel
+                            break
+                    except Exception:
+                        continue
+
+                if not input_sel:
+                    log_cb(f"    Attempt {attempt}: input not found on page")
+                    await browser.close()
+                    await asyncio.sleep(3 * attempt)
+                    continue
+
+                # ── Step 3: Fill number ───────────────────────────────────────
+                try:
+                    await page.fill(input_sel, "")
+                    await asyncio.sleep(0.3)
+                    await page.fill(input_sel, number)
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    log_cb(f"    Attempt {attempt}: fill failed — {str(e)[:50]}")
+                    await browser.close()
+                    await asyncio.sleep(3 * attempt)
+                    continue
+
+                # ── Step 4: Click Next ────────────────────────────────────────
+                clicked = False
+                for label in ["Next", "Submit", "Check", "Go", "Search"]:
+                    try:
+                        btn = page.locator(f'button:has-text("{label}")')
+                        if await btn.count() > 0 and await btn.first.is_visible():
+                            await btn.first.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+
+                if not clicked:
+                    try:
+                        btn = page.locator('button[type="submit"]')
+                        if await btn.count() > 0:
+                            await btn.first.click()
+                            clicked = True
+                    except Exception:
+                        pass
+
+                if not clicked:
+                    try:
+                        await page.keyboard.press("Enter")
+                        clicked = True
+                    except Exception:
+                        pass
+
+                if not clicked:
+                    log_cb(f"    Attempt {attempt}: no button found")
+                    await browser.close()
+                    await asyncio.sleep(3 * attempt)
+                    continue
+
+                # ── Step 5: Wait for result ───────────────────────────────────
+                valid_loc   = page.locator("#amountPaid")
+                invalid_loc = page.locator("text=Invalid account number")
+
+                try:
+                    await aexpect(
+                        valid_loc.or_(invalid_loc)
+                    ).to_be_visible(timeout=30000)
+                except Exception as e:
+                    log_cb(f"    Attempt {attempt}: result timeout — {str(e)[:50]}")
+                    await browser.close()
+                    await asyncio.sleep(3 * attempt)
+                    continue
+
+                await asyncio.sleep(0.5)  # let DOM fully update
+
+                # ── Step 6: Read result ───────────────────────────────────────
+                try:
+                    if await valid_loc.is_visible():
+                        bill = await valid_loc.input_value()
+                        await browser.close()
+                        return "Valid", bill
+                except Exception:
+                    pass
+
+                try:
+                    if await invalid_loc.is_visible():
+                        await browser.close()
+                        return "Invalid", ""
+                except Exception:
+                    pass
+
+                # Got neither — retry
+                log_cb(f"    Attempt {attempt}: result unclear, retrying…")
+                await browser.close()
+                await asyncio.sleep(3 * attempt)
+
+        except Exception as e:
+            log_cb(f"    Attempt {attempt}: unexpected error — {str(e)[:60]}")
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            await asyncio.sleep(3 * attempt)
+
+    # All 3 attempts failed
+    return "Error", "Failed after 3 attempts"
+
+
+async def check_numbers_async(numbers, delay_ms, progress_cb, status_cb, log_cb):
+    total   = len(numbers)
+    results = []
+
+    for idx, number in enumerate(numbers):
+        status_cb(f"⏳ ({idx+1}/{total}) Checking: **{number}**")
+        log_cb(f"({idx+1}/{total}) → {number}")
+
+        status, bill = await check_one_number(number, log_cb)
+
+        if status == "Valid":
+            log_cb(f"  ✅ Valid — Bill: {bill}")
+        elif status == "Invalid":
+            log_cb(f"  ❌ Invalid")
+        elif status == "Error":
+            log_cb(f"  ⚠️ Error: {bill}")
+        else:
+            log_cb(f"  ❓ Unknown")
+
+        results.append({"number": number, "status": status, "bill": bill})
+        progress_cb((idx + 1) / total)
+
+        # Fixed delay between numbers — gives the server breathing room
+        await asyncio.sleep(delay_ms / 1000)
+
     return results
 
 
@@ -301,8 +271,8 @@ if uploaded_file:
 
         with st.expander("⚙️ Settings"):
             delay_ms = st.slider(
-                "Delay between requests (ms)", 1500, 4000, 2000, step=100,
-                help="Default: 2000ms. Increase if website is slow or rate-limiting."
+                "Delay between numbers (ms)", 2000, 8000, 3000, step=500,
+                help="Time to wait between each number. Higher = more reliable."
             )
 
         if st.button("🚀 Start Validity Check", type="primary"):
@@ -319,6 +289,11 @@ if uploaded_file:
             numbers = []
             for n in df["Landline"].astype(str).str.strip():
                 numbers.append(n if n.startswith("0") else "0" + n)
+
+            # Estimated time warning
+            est_seconds = len(numbers) * (delay_ms / 1000 + 15)
+            est_minutes = round(est_seconds / 60, 1)
+            st.info(f"⏱️ Estimated time: ~{est_minutes} minutes for {len(numbers)} numbers")
 
             results = run_check(
                 numbers     = numbers,
